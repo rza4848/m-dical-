@@ -269,9 +269,6 @@ input[readonly]{background:#f3f4f6!important;color:var(--mu)!important;}
     <div class="auth-link">
       <a onclick="showScreen('forgot-screen')">Mot de passe oublié ?</a>
     </div>
-    <div style="margin-top:20px;font-size:12px;color:#9ca3af;text-align:center;">
-      <a onclick="showScreen('cfg-screen')" style="color:var(--mu);cursor:pointer;">Reconfigurer Supabase</a>
-    </div>
   </div>
 </div>
 
@@ -627,8 +624,11 @@ input[readonly]{background:#f3f4f6!important;color:var(--mu)!important;}
 
 <script>
 // ════════════════════════════════════════
-//  SUPABASE
+//  SUPABASE — CONFIG INTÉGRÉE
 // ════════════════════════════════════════
+var SB_URL = 'https://tmckhxusbvgshwlbkufg.supabase.co';
+var SB_KEY = 'sb_publishable_Kl-A28tr2_jjegorWL3wUw_nprvql8_';
+
 var sb = null;
 var currentUser = null;
 var currentProfile = null;
@@ -637,16 +637,9 @@ function initSB(url, key) {
   sb = supabase.createClient(url, key);
 }
 
-// ════════════════════════════════════════
-//  CONFIG
-// ════════════════════════════════════════
+// CONFIG (gardée pour compatibilité mais non utilisée)
 function saveConfig() {
-  var url = document.getElementById('cfg-url').value.trim();
-  var key = document.getElementById('cfg-key').value.trim();
-  if (!url || !key) { toast('Renseignez l\'URL et la clé.', 'err'); return; }
-  localStorage.setItem('sb_url', url);
-  localStorage.setItem('sb_key', key);
-  initSB(url, key);
+  initSB(SB_URL, SB_KEY);
   toast('Configuration sauvegardée.', 'info');
   checkSession();
 }
@@ -1248,9 +1241,13 @@ function today(){ return new Date().toISOString().split('T')[0]; }
 // ════════════════════════════════════════
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', function(){
-    navigator.serviceWorker.register('sw.js').then(function(){
-      console.log('SW registered');
-    }).catch(function(e){ console.log('SW error:', e); });
+    fetch('sw.js', { method: 'HEAD' }).then(function(r){
+      if (r.ok) {
+        navigator.serviceWorker.register('sw.js').then(function(){
+          console.log('SW registered');
+        }).catch(function(e){ console.log('SW error:', e); });
+      }
+    }).catch(function(){});
   });
 }
 
@@ -1258,16 +1255,9 @@ if ('serviceWorker' in navigator) {
 //  INIT
 // ════════════════════════════════════════
 window.addEventListener('DOMContentLoaded', function() {
-  var url = localStorage.getItem('sb_url');
-  var key = localStorage.getItem('sb_key');
-  if (url && key) {
-    document.getElementById('cfg-url').value = url;
-    document.getElementById('cfg-key').value = key;
-    initSB(url, key);
-    checkSession();
-  } else {
-    showScreen('cfg-screen');
-  }
+  // Connexion automatique — clés intégrées
+  initSB(SB_URL, SB_KEY);
+  checkSession();
   document.getElementById('ex-dat').value = today();
   document.getElementById('tr-deb').value = today();
   document.getElementById('ev-dat').value = today();
