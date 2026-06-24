@@ -198,6 +198,13 @@ input[readonly]{background:#f3f4f6!important;color:var(--mu)!important;}
 .imc-obese1   { color: #ea580c; }
 .imc-obese2   { color: #dc2626; }
 
+
+/* ── OFFLINE BANNER ── */
+#offline-banner{display:none;position:fixed;top:52px;left:0;right:0;background:#92400e;color:#fff;text-align:center;font-size:13px;font-weight:600;padding:8px 16px;z-index:200;}
+#offline-banner.show{display:block;}
+#sync-banner{display:none;position:fixed;top:52px;left:0;right:0;background:var(--g);color:#fff;text-align:center;font-size:13px;font-weight:600;padding:8px 16px;z-index:200;cursor:pointer;}
+#sync-banner.show{display:block;}
+
 /* DESKTOP */
 @media(min-width:700px){
   .bnav{display:none;}
@@ -346,9 +353,10 @@ input[readonly]{background:#f3f4f6!important;color:var(--mu)!important;}
     <div class="pending-icon">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
     </div>
-    <div class="pending-title">Compte en attente</div>
-    <div class="pending-sub">Votre compte a été créé avec succès. Un administrateur doit l'activer avant que vous puissiez vous connecter.</div>
-    <button class="btn-full btn-green" style="max-width:280px;margin:24px auto 0;" onclick="doLogout()">Se déconnecter</button>
+    <div class="pending-title">Compte en attente d'activation</div>
+    <div class="pending-sub">Votre inscription a bien été reçue.<br>Un administrateur doit activer votre compte.<br>Revenez après confirmation.</div>
+    <button class="btn-full btn-green" style="max-width:280px;margin:20px auto 0;" onclick="checkSession()">Vérifier l'activation</button>
+    <button class="btn-full" style="max-width:280px;margin:10px auto 0;border:1px solid var(--bd);background:#fff;color:var(--mu);" onclick="doLogout()">Se déconnecter</button>
   </div>
 </div>
 
@@ -365,7 +373,10 @@ input[readonly]{background:#f3f4f6!important;color:var(--mu)!important;}
     </div>
   </div>
 
-  <div class="app-wrap">
+  
+<div id="offline-banner">Hors ligne — Les données sont sauvegardées localement et seront synchronisées au retour du réseau.</div>
+<div id="sync-banner" onclick="syncPendingData()">Réseau rétabli — Appuyez pour synchroniser les données en attente.</div>
+<div class="app-wrap">
     <div class="side">
       <div class="nlbl">Menu</div>
       <div class="ni on"  onclick="go('dashboard',this)">Tableau de bord</div>
@@ -641,6 +652,212 @@ input[readonly]{background:#f3f4f6!important;color:var(--mu)!important;}
 </div>
 
 <script>
+
+// ════════════════════════════════════════
+//  SYSTÈME OFFLINE — IndexedDB + Sync
+// ════════════════════════════════════════
+var DB_NAME = 'cabinet_offline';
+var DB_VERSION = 1;
+var idb = null;
+var isOnline = navigator.onLine;
+
+// Ouvrir IndexedDB
+function openIDB() {
+  return new Promise(function(resolve, reject) {
+    var req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = function(e) {
+      var db = e.target.result;
+      // Stores pour chaque table
+      if (!db.objectStoreNames.contains('patients'))
+        db.createObjectStore('patients', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('antecedents'))
+        db.createObjectStore('antecedents', { keyPath: 'patient_id' });
+      if (!db.objectStoreNames.contains('examens_cliniques'))
+        db.createObjectStore('examens_cliniques', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('traitements'))
+        db.createObjectStore('traitements', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('notes_evolution'))
+        db.createObjectStore('notes_evolution', { keyPath: 'id' });
+      // File d'attente pour sync
+      if (!db.objectStoreNames.contains('pending_sync'))
+        db.createObjectStore('pending_sync', { keyPath: 'id', autoIncrement: true });
+    };
+    req.onsuccess = function(e) { resolve(e.target.result); };
+    req.onerror = function(e) { reject(e); };
+  });
+}
+
+// Sauvegarder dans IndexedDB
+function idbPut(store, data) {
+  return new Promise(function(resolve, reject) {
+    if (!idb) { resolve(); return; }
+    var tx = idb.transaction([store], 'readwrite');
+    var s  = tx.objectStore(store);
+    var req = Array.isArray(data)
+      ? Promise.all(data.map(function(d){ return new Promise(function(r){ s.put(d).onsuccess=r; }); }))
+      : new Promise(function(r){ s.put(data).onsuccess = r; });
+    tx.oncomplete = resolve;
+    tx.onerror = reject;
+  });
+}
+
+// Lire depuis IndexedDB
+function idbGetAll(store) {
+  return new Promise(function(resolve) {
+    if (!idb) { resolve([]); return; }
+    var tx = idb.transaction([store], 'readonly');
+    var req = tx.objectStore(store).getAll();
+    req.onsuccess = function(){ resolve(req.result || []); };
+    req.onerror   = function(){ resolve([]); };
+  });
+}
+
+// Ajouter une opération en attente de sync
+function addPending(table, operation, data) {
+  return new Promise(function(resolve) {
+    if (!idb) { resolve(); return; }
+    var tx = idb.transaction(['pending_sync'], 'readwrite');
+    tx.objectStore('pending_sync').add({
+      table: table, operation: operation,
+      data: data, timestamp: Date.now()
+    });
+    tx.oncomplete = resolve;
+  });
+}
+
+// Vider la file d'attente
+function clearPending() {
+  return new Promise(function(resolve) {
+    if (!idb) { resolve(); return; }
+    var tx = idb.transaction(['pending_sync'], 'readwrite');
+    tx.objectStore('pending_sync').clear();
+    tx.oncomplete = resolve;
+  });
+}
+
+// Détection online/offline
+function updateOnlineStatus() {
+  var wasOffline = !isOnline;
+  isOnline = navigator.onLine;
+  var offBanner  = document.getElementById('offline-banner');
+  var syncBanner = document.getElementById('sync-banner');
+
+  if (!isOnline) {
+    if (offBanner)  offBanner.classList.add('show');
+    if (syncBanner) syncBanner.classList.remove('show');
+  } else {
+    if (offBanner)  offBanner.classList.remove('show');
+    // Si on revient online et qu'on avait des données en attente
+    if (wasOffline) {
+      checkPendingSync();
+    }
+  }
+}
+
+async function checkPendingSync() {
+  if (!idb) return;
+  var pending = await idbGetAll('pending_sync');
+  if (pending.length > 0) {
+    var syncBanner = document.getElementById('sync-banner');
+    if (syncBanner) {
+      syncBanner.textContent = 'Réseau rétabli — ' + pending.length + ' opération(s) en attente. Appuyez pour synchroniser.';
+      syncBanner.classList.add('show');
+    }
+  }
+}
+
+// Synchroniser les données en attente
+async function syncPendingData() {
+  if (!isOnline || !sb) { toast('Pas de connexion réseau.', 'err'); return; }
+  var pending = await idbGetAll('pending_sync');
+  if (!pending.length) {
+    var syncBanner = document.getElementById('sync-banner');
+    if (syncBanner) syncBanner.classList.remove('show');
+    toast('Aucune donnée en attente.', 'info');
+    return;
+  }
+  toast('Synchronisation en cours...', 'info');
+  var errors = 0;
+  for (var i = 0; i < pending.length; i++) {
+    var op = pending[i];
+    try {
+      var res;
+      if (op.operation === 'insert') {
+        res = await sb.from(op.table).insert(op.data);
+      } else if (op.operation === 'update') {
+        res = await sb.from(op.table).update(op.data).eq('id', op.data.id);
+      }
+      if (res && res.error) errors++;
+    } catch(e) { errors++; }
+  }
+  if (errors === 0) {
+    await clearPending();
+    var syncBanner = document.getElementById('sync-banner');
+    if (syncBanner) syncBanner.classList.remove('show');
+    toast(pending.length + ' donnée(s) synchronisée(s) avec succès.', 'ok');
+    loadAll();
+  } else {
+    toast(errors + ' erreur(s) lors de la sync. Réessayez.', 'err');
+  }
+}
+
+// Cache local des patients pour mode offline
+async function cachePatients(data) {
+  if (!idb) return;
+  for (var i = 0; i < data.length; i++) {
+    await idbPut('patients', data[i]);
+  }
+}
+
+// Wrapper pour les requêtes Supabase avec fallback offline
+async function sbQuery(table, query) {
+  if (isOnline) {
+    var res = await query;
+    // Mettre en cache si succès
+    if (!res.error && res.data) {
+      if (Array.isArray(res.data)) {
+        for (var i = 0; i < res.data.length; i++) {
+          await idbPut(table, res.data[i]);
+        }
+      }
+    }
+    return res;
+  } else {
+    // Mode offline : lire depuis IndexedDB
+    var data = await idbGetAll(table);
+    return { data: data, error: null, count: data.length };
+  }
+}
+
+// Wrapper insert avec support offline
+async function sbInsert(table, data) {
+  if (!data.id) data.id = 'offline_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+  data._offline = !isOnline;
+
+  // Toujours sauvegarder localement
+  await idbPut(table, data);
+
+  if (isOnline) {
+    var res = await sb.from(table).insert(data);
+    return res;
+  } else {
+    // Ajouter à la file d'attente
+    await addPending(table, 'insert', data);
+    return { data: data, error: null };
+  }
+}
+
+window.addEventListener('online',  updateOnlineStatus);
+window.addEventListener('offline', updateOnlineStatus);
+
+// Initialiser IndexedDB au démarrage
+openIDB().then(function(db) {
+  idb = db;
+  updateOnlineStatus();
+}).catch(function(e) {
+  console.warn('IndexedDB non disponible:', e);
+});
+
 // ════════════════════════════════════════
 //  SUPABASE — CONFIG INTÉGRÉE
 // ════════════════════════════════════════
@@ -689,7 +906,11 @@ async function checkSession() {
 
 async function loadProfile(uid) {
   var res = await sb.from('profiles').select('*').eq('id', uid).single();
-  if (res.error || !res.data) { showScreen('pending-screen'); return; }
+  if (res.error || !res.data) {
+    // Profil absent — peut arriver si l'inscription a créé le compte Auth mais pas le profil
+    showScreen('pending-screen');
+    return;
+  }
   currentProfile = res.data;
   if (!currentProfile.approved) { showScreen('pending-screen'); return; }
   startApp();
@@ -697,11 +918,25 @@ async function loadProfile(uid) {
 
 function startApp() {
   showScreen('app-screen');
-  document.getElementById('hdr-user-name').textContent =
-    (currentProfile.prenom || '') + ' ' + (currentProfile.nom || '');
-  var isAdmin = currentProfile.role === 'admin';
+  var nom = ((currentProfile.prenom||'') + ' ' + (currentProfile.nom||'')).trim();
+  var role = currentProfile.role || 'infirmier';
+  document.getElementById('hdr-user-name').textContent = nom + ' (' + role + ')';
+
+  var isAdmin = role === 'admin';
   document.getElementById('side-admin').style.display = isAdmin ? 'block' : 'none';
   document.getElementById('more-admin').style.display = isAdmin ? 'block' : 'none';
+
+  // Adapter l'interface selon le rôle
+  // Secrétaire : masquer examen clinique et traitement
+  var isSec = role === 'secretaire';
+  var secItems = document.querySelectorAll('.ni');
+  secItems.forEach(function(el){
+    var txt = el.textContent.trim();
+    if (isSec && (txt === 'Examen clinique' || txt === 'Traitement')) {
+      el.style.display = 'none';
+    }
+  });
+
   loadAll();
   checkInstall();
 }
@@ -735,19 +970,25 @@ async function doRegister() {
   btn.disabled = false; btn.textContent = 'S\'inscrire';
   if (res.error) { toast(res.error.message, 'err'); return; }
   var uid = res.data.user.id;
-  await sb.from('profiles').insert({
+  var profRes = await sb.from('profiles').insert({
     id: uid, email: email, prenom: prenom, nom: nom,
     telephone: tel, role: role, approved: false,
     created_at: new Date().toISOString()
   });
-  toast('Inscription réussie ! En attente d\'activation.', 'ok');
+  if (profRes.error) {
+    toast('Compte créé mais erreur profil : ' + profRes.error.message, 'err');
+  } else {
+    toast('Inscription réussie ! En attente d\'activation.', 'ok');
+  }
   showScreen('pending-screen');
 }
 
 async function doForgot() {
   var email = v('forgot-email');
   if (!email) { toast('Entrez votre email.', 'err'); return; }
-  var res = await sb.auth.resetPasswordForEmail(email);
+  var res = await sb.auth.resetPasswordForEmail(email, {
+    redirectTo: window.location.origin + window.location.pathname
+  });
   if (res.error) { toast(res.error.message, 'err'); return; }
   toast('Email de réinitialisation envoyé !', 'ok');
   showScreen('login-screen');
@@ -764,6 +1005,7 @@ async function doLogout() {
 // ════════════════════════════════════════
 async function loadAdmin() {
   var res = await sb.from('profiles').select('*').order('created_at', { ascending: false });
+  if (res.error) { toast('Erreur chargement utilisateurs : ' + res.error.message, 'err'); return; }
   var profiles = res.data || [];
   var pending = profiles.filter(function(p){ return !p.approved; });
   var all     = profiles.filter(function(p){ return p.approved; });
@@ -802,21 +1044,24 @@ async function loadAdmin() {
 }
 
 async function approveUser(uid) {
-  await sb.from('profiles').update({ approved: true }).eq('id', uid);
-  toast('Compte approuvé.', 'ok');
+  var r = await sb.from('profiles').update({ approved: true }).eq('id', uid);
+  if (r.error) { toast('Erreur : ' + r.error.message, 'err'); return; }
+  toast('Compte approuvé avec succès.', 'ok');
   loadAdmin();
 }
 
 async function rejectUser(uid) {
-  if (!confirm('Supprimer ce compte définitivement ?')) return;
-  await sb.from('profiles').delete().eq('id', uid);
+  if (!confirm('Supprimer définitivement ce compte ?')) return;
+  var r = await sb.from('profiles').delete().eq('id', uid);
+  if (r.error) { toast('Erreur : ' + r.error.message, 'err'); return; }
   toast('Compte supprimé.', 'info');
   loadAdmin();
 }
 
 async function suspendUser(uid) {
-  if (!confirm('Suspendre cet utilisateur ?')) return;
-  await sb.from('profiles').update({ approved: false }).eq('id', uid);
+  if (!confirm('Suspendre cet utilisateur ? Il ne pourra plus se connecter.')) return;
+  var r = await sb.from('profiles').update({ approved: false }).eq('id', uid);
+  if (r.error) { toast('Erreur : ' + r.error.message, 'err'); return; }
   toast('Utilisateur suspendu.', 'info');
   loadAdmin();
 }
@@ -868,16 +1113,25 @@ function toast(msg, type) {
 //  LOAD ALL — Supabase
 // ════════════════════════════════════════
 async function loadAll() {
-  if (!sb) return;
-  var pc = await sb.from('patients').select('id', { count: 'exact', head: true });
-  var ec = await sb.from('examens_cliniques').select('id', { count: 'exact', head: true });
-  var tc = await sb.from('traitements').select('id', { count: 'exact', head: true });
-  document.getElementById('cnt-p').textContent = pc.count || 0;
-  document.getElementById('cnt-e').textContent = ec.count || 0;
-  document.getElementById('cnt-t').textContent = tc.count || 0;
-
-  var res = await sb.from('patients').select('*').order('created_at', { ascending: false }).limit(5);
-  var pts = res.data || [];
+  if (!sb && isOnline) return;
+  var pts = [];
+  if (isOnline) {
+    var pc = await sb.from('patients').select('id', { count: 'exact', head: true });
+    var ec = await sb.from('examens_cliniques').select('id', { count: 'exact', head: true });
+    var tc = await sb.from('traitements').select('id', { count: 'exact', head: true });
+    document.getElementById('cnt-p').textContent = pc.count || 0;
+    document.getElementById('cnt-e').textContent = ec.count || 0;
+    document.getElementById('cnt-t').textContent = tc.count || 0;
+    var res = await sb.from('patients').select('*').order('created_at', { ascending: false }).limit(5);
+    pts = res.data || [];
+    await cachePatients(pts);
+  } else {
+    var all = await idbGetAll('patients');
+    pts = all.slice(0,5);
+    document.getElementById('cnt-p').textContent = all.length;
+    document.getElementById('cnt-e').textContent = '(offline)';
+    document.getElementById('cnt-t').textContent = '(offline)';
+  }
   var scls=['war','ok','ok','inf','err'], sts=['Suivi actif','Stable','Favorable','En cours','Urgent'];
   document.getElementById('db-list').innerHTML = pts.length
     ? pts.map(function(p, i){
@@ -896,21 +1150,32 @@ async function loadAll() {
 //  PATIENTS
 // ════════════════════════════════════════
 async function genDos() {
-  var res = await sb.from('patients').select('id', { count: 'exact', head: true });
-  return 'SAD-' + String((res.count || 0) + 1).padStart(3,'0');
+  var res = await sb.from('patients').select('numero_dossier').order('created_at', { ascending: false }).limit(1);
+  if (res.data && res.data.length > 0) {
+    var last = res.data[0].numero_dossier || 'SAD-000';
+    var num = parseInt(last.replace('SAD-','')) || 0;
+    return 'SAD-' + String(num + 1).padStart(3,'0');
+  }
+  return 'SAD-001';
 }
 
 async function resetPatient() {
-  ['p-nom','p-pre','p-age','p-adr','p-pro','p-tel','p-mai','p-enf','p-unm','p-ute'].forEach(function(id){ document.getElementById(id).value=''; });
-  document.getElementById('p-sit').value='';
-  document.getElementById('p-dos').value = await genDos();
-  document.getElementById('p-dat').value = today();
+  ['p-nom','p-pre','p-age','p-adr','p-pro','p-tel','p-mai','p-enf','p-unm','p-ute'].forEach(function(id){
+    var el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  var sit = document.getElementById('p-sit');
+  if (sit) sit.value = '';
+  var dos = document.getElementById('p-dos');
+  if (dos) dos.value = await genDos();
+  var dat = document.getElementById('p-dat');
+  if (dat) dat.value = today();
 }
 
 async function savePatient() {
   var nom=v('p-nom'), pre=v('p-pre'), tel=v('p-tel'), age=v('p-age');
   if (!nom||!pre||!tel||!age) { toast('Nom, prénom, téléphone et âge requis.','err'); return; }
-  var res = await sb.from('patients').insert({
+  var patientData = {
     numero_dossier: v('p-dos'),
     nom: nom, prenom: pre, age: parseInt(age),
     adresse: v('p-adr'), profession: v('p-pro'),
@@ -919,18 +1184,29 @@ async function savePatient() {
     nb_enfants: parseInt(v('p-enf'))||0,
     urgence_nom: v('p-unm'), urgence_tel: v('p-ute'),
     created_at: new Date().toISOString()
-  });
-  if (res.error) { toast('Erreur : ' + res.error.message, 'err'); return; }
-  toast('Patient ' + nom + ' ' + pre + ' enregistré.');
-  resetPatient();
+  };
+  var res = await sbInsert('patients', patientData);
+  if (res.error) { toast('Erreur enregistrement : ' + res.error.message, 'err'); return; }
+  if (!isOnline) {
+    toast('Patient sauvegardé localement. Sera synchronisé au retour du réseau.', 'info');
+  } else {
+    toast('Patient ' + nom + ' ' + pre + ' enregistré avec succès.', 'ok');
+  }
+  await resetPatient();
   loadAll();
 }
 
 var _allPts = [];
 async function renderListe() {
-  if (!sb) return;
-  var res = await sb.from('patients').select('*').order('created_at', { ascending: false });
-  _allPts = res.data || [];
+  if (!sb && isOnline) return;
+  var res;
+  if (isOnline) {
+    res = await sb.from('patients').select('*').order('created_at', { ascending: false });
+    _allPts = res.data || [];
+    await cachePatients(_allPts);
+  } else {
+    _allPts = await idbGetAll('patients');
+  }
   var q = (document.getElementById('srch').value||'').toLowerCase();
   var rows = _allPts.filter(function(p){ return (p.nom+p.prenom+(p.numero_dossier||'')).toLowerCase().includes(q); });
   document.getElementById('liste-cards').innerHTML = rows.length
@@ -948,6 +1224,7 @@ async function fillSelect(sid) {
   var el = document.getElementById(sid);
   if (!el || !sb) return;
   var res = await sb.from('patients').select('id,nom,prenom,numero_dossier').order('nom');
+  if (res.error) return;
   var pts = res.data || [];
   el.innerHTML = '<option value="">— Choisir un patient —</option>'
     + pts.map(function(p){ return '<option value="' + p.id + '">' + p.nom + ' ' + p.prenom + ' (' + (p.numero_dossier||'') + ')</option>'; }).join('');
@@ -959,7 +1236,7 @@ async function fillSelect(sid) {
 async function saveAntecedents() {
   var pid=v('at-pid'), mot=v('at-mot');
   if (!pid||!mot) { toast('Patient et motif requis.','err'); return; }
-  var check = await sb.from('antecedents').select('id').eq('patient_id', pid).single();
+  var check = await sb.from('antecedents').select('id').eq('patient_id', pid).maybeSingle();
   var op;
   if (check.data) {
     op = await sb.from('antecedents').update({ motif: mot, medicaux: v('at-med'), chirurgicaux: v('at-chi'), allergiques: v('at-all'), gyneco: v('at-gyn'), familiaux: v('at-fam'), intoxications: v('at-int') }).eq('patient_id', pid);
@@ -974,12 +1251,16 @@ async function saveAntecedents() {
 //  EXAMEN
 // ════════════════════════════════════════
 function calcIMC() {
-  var p = parseFloat(v('ex-po')), t = parseFloat(v('ex-ta2')) / 100;
-  var el = document.getElementById('ex-imc');
+  var poids = parseFloat(v('ex-po'));
+  var tailleRaw = parseFloat(v('ex-ta2'));
+  // Toujours traiter comme cm (si quelqu'un saisit 1.70 au lieu de 170, corriger)
+  var tailleCm = (tailleRaw > 0 && tailleRaw < 3) ? tailleRaw * 100 : tailleRaw;
+  var tM = tailleCm / 100; // convertir en mètres pour la formule
+  var el  = document.getElementById('ex-imc');
   var lbl = document.getElementById('imc-lbl');
-  var vc = document.getElementById('vc-imc');
-  if (p>0 && t>0) {
-    var imc = (p/(t*t));
+  var vc  = document.getElementById('vc-imc');
+  if (poids > 0 && tM > 0) {
+    var imc = poids / (tM * tM);
     el.value = imc.toFixed(1);
     vc.classList.remove('v-normal','v-alert');
     lbl.className = 'imc-label';
@@ -990,14 +1271,14 @@ function calcIMC() {
     } else if (imc <= 30) {
       lbl.textContent = 'Surpoids'; lbl.classList.add('imc-surpoids');
     } else if (imc <= 35) {
-      lbl.textContent = 'Obésité modérée'; lbl.classList.add('imc-obese1'); vc.classList.add('v-alert');
+      lbl.textContent = 'Obesite moderee'; lbl.classList.add('imc-obese1'); vc.classList.add('v-alert');
     } else {
-      lbl.textContent = 'Obésité sévère'; lbl.classList.add('imc-obese2'); vc.classList.add('v-alert');
+      lbl.textContent = 'Obesite severe'; lbl.classList.add('imc-obese2'); vc.classList.add('v-alert');
     }
   } else {
     el.value = '';
     if (lbl) { lbl.textContent = ''; lbl.className = 'imc-label'; }
-    if (vc) vc.classList.remove('v-normal','v-alert');
+    if (vc)  vc.classList.remove('v-normal','v-alert');
   }
 }
 
@@ -1061,7 +1342,7 @@ async function saveExamen() {
     temperature: parseFloat(v('ex-tmp'))||null, ta: v('ex-ta'),
     fc: parseInt(v('ex-fc'))||null, fr: parseInt(v('ex-fr'))||null,
     poids: parseFloat(v('ex-po'))||null,
-    taille: (function(){ var t=parseFloat(v('ex-ta2')); return t ? (t < 3 ? Math.round(t*100) : t) : null; })(),
+    taille: (function(){ var t=parseFloat(v('ex-ta2')); return (t&&t>0) ? (t<3 ? Math.round(t*100) : t) : null; })(),
     imc: parseFloat(v('ex-imc'))||null, spo2: parseInt(v('ex-sp'))||null,
     signes_fonctionnels: v('ex-sf'), cardiovasculaire: v('ex-cv'),
     respiratoire: v('ex-resp'), abdomen: v('ex-abd'),
@@ -1072,7 +1353,24 @@ async function saveExamen() {
     diagnostic_infirmier: v('ex-di')
   });
   if (res.error) { toast('Erreur : ' + res.error.message, 'err'); return; }
-  toast('Examen enregistré.');
+  toast('Examen enregistré avec succès.', 'ok');
+  // Vider les champs de l'examen
+  ['ex-tmp','ex-ta','ex-fc','ex-fr','ex-po','ex-ta2','ex-imc','ex-sp',
+   'ex-sf','ex-cv','ex-resp','ex-abd','ex-neuro','ex-osteo','ex-derm','ex-autre',
+   'ex-hd','ex-ec','ex-res','ex-dc','ex-di'].forEach(function(id){
+    var el=document.getElementById(id); if(el) el.value='';
+  });
+  document.getElementById('ex-dat').value = today();
+  // Réinitialiser les couleurs vitales
+  ['vc-tmp','vc-ta','vc-fc','vc-fr','vc-sp','vc-imc'].forEach(function(id){
+    var el=document.getElementById(id);
+    if(el){ el.classList.remove('v-normal','v-alert'); }
+  });
+  ['st-tmp','st-ta','st-fc','st-fr','st-sp'].forEach(function(id){
+    var el=document.getElementById(id);
+    if(el){ el.textContent=''; el.className='vc-status'; }
+  });
+  var lbl=document.getElementById('imc-lbl'); if(lbl){ lbl.textContent=''; lbl.className='imc-label'; }
   loadAll();
 }
 
@@ -1089,7 +1387,12 @@ async function saveTraitement() {
     prescripteur: v('tr-prs'), actif: true
   });
   if (res.error) { toast('Erreur : ' + res.error.message, 'err'); return; }
-  toast('Traitement ajouté.');
+  toast('Traitement ajouté avec succès.', 'ok');
+  // Vider les champs du traitement
+  ['tr-nom','tr-pos','tr-dur','tr-prs'].forEach(function(id){ var el=document.getElementById(id); if(el) el.value=''; });
+  var deb = document.getElementById('tr-deb'); if(deb) deb.value = today();
+  document.getElementById('tr-frq').value = 'Quotidien';
+  document.getElementById('tr-typ').value = 'medicament';
   renderTraitements();
   loadAll();
 }
@@ -1101,8 +1404,9 @@ async function renderTraitements() {
   var trs = res.data || [];
   document.getElementById('tr-tbody').innerHTML = trs.length
     ? trs.map(function(t){
+        var typeBadge = t.type==='medicament' ? 'inf' : (t.type==='chirurgie' ? 'err' : 'ok');
         return '<tr><td><strong>' + t.nom + '</strong></td>'
-          + '<td><span class="badge ' + (t.type==='medicament'?'inf':'ok') + '">' + (t.type||'—') + '</span></td>'
+          + '<td><span class="badge ' + typeBadge + '">' + (t.type||'—') + '</span></td>'
           + '<td>' + (t.posologie||'—') + '</td><td>' + (t.frequence||'—') + '</td><td>' + (t.duree||'—') + '</td></tr>';
       }).join('')
     : '<tr><td class="empty" colspan="5">Aucun traitement.</td></tr>';
@@ -1120,7 +1424,12 @@ async function saveEvolution() {
     infirmier: v('ev-inf'), prochain_rdv: v('ev-rdv')||null
   });
   if (res.error) { toast('Erreur : ' + res.error.message, 'err'); return; }
-  toast('Visite enregistrée.');
+  toast('Visite enregistrée avec succès.', 'ok');
+  // Vider les champs de la visite
+  ['ev-obs','ev-inf'].forEach(function(id){ var el=document.getElementById(id); if(el) el.value=''; });
+  var rdv = document.getElementById('ev-rdv'); if(rdv) rdv.value='';
+  document.getElementById('ev-dat').value = today();
+  document.getElementById('ev-sta').value = 'Favorable';
   renderEvolutions();
 }
 
@@ -1174,7 +1483,17 @@ async function buildText(pid) {
     txt += '=== DOSSIER MEDICAL ===\nCabinet Medical · ' + dateNow + '\n\n';
     txt += 'N° : ' + (p.numero_dossier||'—') + '\nNom : ' + p.nom + ' ' + p.prenom + '\nAge : ' + p.age + ' ans\nTel : ' + p.telephone + '\n';
     if (at) txt += '\nMotif : ' + at.motif + '\nAnt. medicaux : ' + (at.medicaux||'—') + '\n';
-    if (ex) txt += '\nExamen (' + ex.date_examen + ') :\nT° ' + (ex.temperature||'?') + ' | TA ' + (ex.ta||'?') + ' | FC ' + (ex.fc||'?') + ' | IMC ' + (ex.imc||'?') + '\nDiagnostic : ' + (ex.hypotheses||'—') + '\n';
+    if (ex) {
+      var tC = ex.taille ? (ex.taille < 3 ? Math.round(ex.taille*100) : ex.taille) : '?';
+      var iC = (ex.poids && ex.taille) ? (ex.poids/Math.pow(tC/100,2)).toFixed(1) : (ex.imc||'?');
+      txt += '\nExamen (' + ex.date_examen + ') :\n';
+      txt += 'T° ' + (ex.temperature||'?') + '°C | TA ' + (ex.ta||'?') + ' | FC ' + (ex.fc||'?') + ' bpm | FR ' + (ex.fr||'?') + '/min\n';
+      txt += 'Poids ' + (ex.poids||'?') + 'kg | Taille ' + tC + 'cm | IMC ' + iC + ' | SpO2 ' + (ex.spo2||'?') + '%\n';
+      if (ex.hypotheses) txt += 'Hypotheses : ' + ex.hypotheses + '\n';
+      if (ex.resultats_examens) txt += 'Resultats : ' + ex.resultats_examens + '\n';
+      if (ex.diagnostic_certitude) txt += 'Diag. medical : ' + ex.diagnostic_certitude + '\n';
+      if (ex.diagnostic_infirmier) txt += 'Diag. infirmier : ' + ex.diagnostic_infirmier + '\n';
+    }
     if (trs.length) { txt += '\nTraitements :\n'; trs.forEach(function(t){ txt += '- ' + t.nom + ' · ' + (t.posologie||'') + '\n'; }); }
     if (evs.length) txt += '\nDerniere visite (' + evs[0].date_visite + ') : ' + evs[0].observation + '\n';
     txt += '\n';
@@ -1227,22 +1546,36 @@ async function generatePDF(pid) {
     html += '<div class="header"><div><div class="cabinet-name">Cabinet Medical</div><div class="cabinet-sub">Dossier medical &mdash; Edite le '+dateNow+'</div></div><div class="dossier-num">'+(p.numero_dossier||'—')+'</div></div>';
     var adminT = '<table>'+row('Nom complet',p.nom+' '+p.prenom)+row('Age',(p.age||'—')+' ans')+row('Telephone',p.telephone)+row('Adresse',p.adresse)+row('Profession',p.profession)+row('Situation',p.situation_famille)+'</table>';
     html += sec('Renseignements administratifs', adminT);
-    if (at) { var atT='<table>'+row('Motif',at.motif)+row('Medicaux',at.medicaux)+row('Chirurgicaux',at.chirurgicaux)+row('Allergies',at.allergiques)+row('Gyneco',at.gyneco)+row('Familiaux',at.familiaux)+row('Intoxications',at.intoxications)+'</table>'; html+=sec('Antecedents',atT); }
+    if (at) { var atT='<table>'+row('Motif',at.motif)+row('Medicaux',at.medicaux)+row('Chirurgicaux',at.chirurgicaux)+row('Gyneco-obstetricaux',at.gyneco)+row('Allergies',at.allergiques)+row('Familiaux',at.familiaux)+row('Intoxications',at.intoxications)+'</table>'; html+=sec('Antecedents',atT); }
     if (ex) {
-      var tailleCm = ex.taille ? (ex.taille < 3 ? Math.round(ex.taille * 100) : ex.taille) : null;
+      var tailleCm = ex.taille ? (ex.taille < 3 ? Math.round(ex.taille*100) : Math.round(ex.taille)) : null;
       var poidsKg  = ex.poids || null;
-      var imcCalc  = (tailleCm && poidsKg) ? (poidsKg / Math.pow(tailleCm/100, 2)).toFixed(1) : (ex.imc || null);
+      var imcVal   = (tailleCm && poidsKg) ? (poidsKg / Math.pow(tailleCm/100, 2)).toFixed(1) : (ex.imc ? parseFloat(ex.imc).toFixed(1) : null);
       var vit='<div class="vitals-row">';
-      vit+='<div class="vital"><div class="vname">T°C</div><div class="vval">'+(ex.temperature||'&mdash;')+'</div></div>';
+      vit+='<div class="vital"><div class="vname">T &deg;C</div><div class="vval">'+(ex.temperature||'&mdash;')+'</div></div>';
       vit+='<div class="vital"><div class="vname">TA mmHg</div><div class="vval">'+(ex.ta||'&mdash;')+'</div></div>';
       vit+='<div class="vital"><div class="vname">FC bpm</div><div class="vval">'+(ex.fc||'&mdash;')+'</div></div>';
       vit+='<div class="vital"><div class="vname">FR /min</div><div class="vval">'+(ex.fr||'&mdash;')+'</div></div>';
       vit+='<div class="vital"><div class="vname">Poids kg</div><div class="vval">'+(poidsKg||'&mdash;')+'</div></div>';
       vit+='<div class="vital"><div class="vname">Taille cm</div><div class="vval">'+(tailleCm||'&mdash;')+'</div></div>';
-      vit+='<div class="vital"><div class="vname">IMC</div><div class="vval">'+(imcCalc||'&mdash;')+'</div></div>';
+      vit+='<div class="vital"><div class="vname">IMC</div><div class="vval">'+(imcVal||'&mdash;')+'</div></div>';
       vit+='<div class="vital"><div class="vname">SpO2 %</div><div class="vval">'+(ex.spo2||'&mdash;')+'</div></div>';
       vit+='</div>';
-      var exT='<table>'+row('Signes fonctionnels',ex.signes_fonctionnels)+row('Cardiovasculaire',ex.cardiovasculaire)+row('Respiratoire',ex.respiratoire)+row('Abdomen',ex.abdomen)+row('Neurologique',ex.neurologique)+row('Osteo-articulaire',ex.osteo_articulaire)+row('Dermatologique',ex.dermatologique)+row('Autres',ex.autres_appareils)+row('Diagnostics',ex.hypotheses)+row('Examens comp.',ex.examens_comp)+'</table>';
+      var exT='<table>'
+        +row('Signes fonctionnels',ex.signes_fonctionnels)
+        +row('Cardiovasculaire',ex.cardiovasculaire)
+        +row('Respiratoire',ex.respiratoire)
+        +row('Abdomen',ex.abdomen)
+        +row('Neurologique',ex.neurologique)
+        +row('Osteo-articulaire',ex.osteo_articulaire)
+        +row('Dermatologique',ex.dermatologique)
+        +row('Autres appareils',ex.autres_appareils)
+        +row('Hypotheses diagnostiques',ex.hypotheses)
+        +row('Examens complementaires',ex.examens_comp)
+        +row('Resultats des examens',ex.resultats_examens)
+        +row('Diagnostic medical retenu',ex.diagnostic_certitude)
+        +row('Diagnostic infirmier',ex.diagnostic_infirmier)
+        +'</table>';
       html+=sec('Examen clinique ('+ex.date_examen+')',vit+exT);
     }
     if (trs.length) { var trT='<table><tr><th>Nom</th><th>Type</th><th>Posologie</th><th>Frequence</th><th>Duree</th></tr>'+trs.map(function(t){ return '<tr><td><strong>'+t.nom+'</strong></td><td>'+(t.type||'')+'</td><td>'+(t.posologie||'&mdash;')+'</td><td>'+(t.frequence||'&mdash;')+'</td><td>'+(t.duree||'&mdash;')+'</td></tr>'; }).join('')+'</table>'; html+=sec('Traitements',trT); }
@@ -1367,12 +1700,18 @@ window.addEventListener('DOMContentLoaded', function() {
   document.getElementById('tr-deb').value = today();
   document.getElementById('ev-dat').value = today();
 
-  // Listen for auth state changes
-  if (sb) {
-    sb.auth.onAuthStateChange(function(event, session) {
-      if (event === 'SIGNED_OUT') showScreen('login-screen');
-    });
-  }
+  // Listen for auth state changes — enregistré après initSB
+  sb.auth.onAuthStateChange(function(event, session) {
+    if (event === 'SIGNED_OUT') {
+      currentUser = null; currentProfile = null;
+      showScreen('login-screen');
+    }
+    if (event === 'PASSWORD_RECOVERY') {
+      // Afficher formulaire reset mot de passe
+      showScreen('login-screen');
+      toast('Entrez votre nouveau mot de passe.', 'info');
+    }
+  });
 });
 </script>
 </body>
